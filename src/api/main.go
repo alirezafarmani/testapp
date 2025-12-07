@@ -209,4 +209,21 @@ func main() {
                 metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
                         "method": r.Method, "endpoint": "/api/users", "status": "200",
                 })
-                metricsRegistry.SetGauge("http
+                metricsRegistry.SetGauge("http_request_duration_seconds", time.Since(requestStart).Seconds(), map[string]string{
+                 "endpoint": "/api/users",
+                })
+                metricsRegistry.SetGauge("app_goroutines", float64(runtime.NumGoroutine()), map[string]string{})
+
+                log.Printf("[USERS:%s] SUCCESS: Retrieved %d users", requestID, len(usersList))
+                log.Printf("[USERS:%s] Sending response to client", requestID)
+
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(map[string]interface{}{
+                "success": true,
+                "message": "Users retrieved successfully",
+                "count":   len(usersList),
+                "users":   usersList,
+                 })
+                    log.Printf("[USERS:%s] Request completed successfully", requestID)
+                 }))
+                log.Println("[HTTP] /api/users endpoint registered")
