@@ -1,229 +1,151 @@
 package main
 
 import (
-        "encoding/json"
-        "fmt"
-        "log"
-        "net/http"
-        "os"
-        "runtime"
-        "sync"
-        "time"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-        "api/internal/func1"
-        "api/internal/func2"
-        "api/internal/metrics"
-        "api/internal/pg_gateway"
-        "api/internal/redis_gateway"
-        "api/internal/usage"
-        "api/internal/users"
+	"api/internal/metrics"
+	"api/internal/pg_gateway"
+	"api/internal/redis_gateway"
+	"api/internal/users"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
-
-type SetRequest struct {
-        Key   string `json:"key"`
-        Value string `json:"value"`
+type StructuredLog struct {
+	Timestamp string                 `json:"timestamp"`
+	Level     string                 `json:"level"`
+	Message   string                 `json:"message"`
+	Component string                 `json:"component"`
+	Duration  float64                `json:"duration_ms,omitempty"`
+	Context   map[string]interface{} `json:"context,omitempty"`
 }
 
 type UserRequest struct {
-        FirstName     string `json:"first_name"`
-        LastName      string `json:"last_name"`
-        Age           int    `json:"age"`
-        MaritalStatus bool   `json:"marital_status"`
+	FirstName     string `json:"first_name"`
+	LastName      string `json:"last_name"`
+	Age           int    `json:"age"`
+	MaritalStatus bool   `json:"marital_status"`
 }
-
-type Response struct {
-        Success bool   `json:"success"`
-        Message string `json:"message"`
-}
-
-var (
-        metricsRegistry   *metrics.Registry
-        loadedKeys        []string
-        loadedKeysMutex   sync.RWMutex
-        loadedValues      []string
-        loadedValuesMutex sync.RWMutex
-        usersManager      *users.UsersManager
-)
 
 func main() {
-        log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	log.SetFlags(0)
+	writeLog("INFO", "Application startup initiated", "system", nil)
 
-        log.Println("========================================")
-        log.Println("APPLICATION STARTUP INITIATED")
-        log.Println("========================================")
+	// 1. Configs
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	queueName := getEnv("RABBITMQ_QUEUE", "user_tasks")
+	metricsPort := getEnv("METRICS_PORT", "9090")
 
-        log.Println("[INIT] Reading environment variables...")
-        redisHost := getEnv("REDIS_HOST", "localhost")
-        redisPort := getEnv("REDIS_PORT", "6379")
-        log.Printf("[INIT] Redis configuration: host=%s, port=%s", redisHost, redisPort)
+	// 2. Initializing Core Services
+	reg := metrics.NewRegistry()
+	redisClient := redis_gateway.NewRedisClient(getEnv("REDIS_HOST", "localhost") + ":6379")
+	pgClient := pg_gateway.NewPGClient(
+		getEnv("POSTGRES_HOST", "localhost"),
+		getEnv("POSTGRES_PORT", "5432"),
+		getEnv("POSTGRES_USER", "appuser"),
+		getEnv("POSTGRES_PASSWORD", "apppass"),
+		getEnv("POSTGRES_DB", "appdb"),
+	)
+	
+	userManager := users.NewUsersManager(redisClient, pgClient, reg)
 
-        pgHost := getEnv("POSTGRES_HOST", "localhost")
-        pgPort := getEnv("POSTGRES_PORT", "5432")
-        pgUser := getEnv("POSTGRES_USER", "appuser")
-        pgPass := getEnv("POSTGRES_PASSWORD", "apppass")
-        pgDB := getEnv("POSTGRES_DB", "appdb")
-        log.Printf("[INIT] PostgreSQL configuration: host=%s, port=%s, user=%s, db=%s", pgHost, pgPort, pgUser, pgDB)
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		writeLog("INFO", fmt.Sprintf("Prometheus exporter started on port %s", metricsPort), "monitoring", nil)
+		if err := http.ListenAndServe(":"+metricsPort, nil); err != nil {
+			writeLog("ERROR", "Metrics server failed", "monitoring", map[string]interface{}{"error": err.Error()})
+		}
+	}()
 
-        log.Println("[INIT] Initializing metrics registry...")
-        metricsRegistry = metrics.NewRegistry()
-        log.Println("[INIT] Metrics registry initialized successfully")
+	// 4. RabbitMQ Connection
+	conn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		writeLog("FATAL", "Failed to connect to RabbitMQ", "rabbitmq", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
+	}
+	defer conn.Close()
 
-        log.Printf("[REDIS] Attempting to connect to Redis at %s:%s...", redisHost, redisPort)
-        startTime := time.Now()
-        redisClient := redis_gateway.NewRedisClient(redisHost + ":" + redisPort)
-        defer redisClient.Close()
-        log.Printf("[REDIS] Connected successfully in %v", time.Since(startTime))
-        redisClient.SetMetricsRegistry(metricsRegistry)
-        log.Println("[REDIS] Metrics registry attached to Redis client")
+	ch, err := conn.Channel()
+	if err != nil {
+		writeLog("FATAL", "Failed to open RabbitMQ channel", "rabbitmq", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
+	}
+	defer ch.Close()
 
-        log.Printf("[POSTGRES] Attempting to connect to PostgreSQL at %s:%s...", pgHost, pgPort)
-        startTime = time.Now()
-        pgClient := pg_gateway.NewPGClient(pgHost, pgPort, pgUser, pgPass, pgDB)
-        defer pgClient.Close()
-        log.Printf("[POSTGRES] Connected successfully in %v", time.Since(startTime))
-        pgClient.SetMetricsRegistry(metricsRegistry)
-        log.Println("[POSTGRES] Metrics registry attached to PostgreSQL client")
+	q, err := ch.QueueDeclare(queueName, true, false, false, false, amqp.Table{"x-queue-type": "quorum"})
+	if err != nil {
+		writeLog("FATAL", "Failed to declare queue", "rabbitmq", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
+	}
 
-        log.Println("[POSTGRES] Creating database table if not exists...")
-        if err := pgClient.CreateTable(); err != nil {
-                log.Printf("[POSTGRES] WARNING: Could not create table: %v", err)
-        } else {
-                log.Println("[POSTGRES] Table created/verified successfully")
-        }
+	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
+	if err != nil {
+		writeLog("FATAL", "Failed to register consumer", "rabbitmq", map[string]interface{}{"error": err.Error()})
+		os.Exit(1)
+	}
 
-        log.Println("[MONITOR] Starting memory monitoring goroutine...")
-        go usage.MonitorMemory(metricsRegistry)
-        log.Println("[MONITOR] Memory monitoring started")
+	// 5. Graceful Shutdown handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-        log.Println("[MONITOR] Starting array keeper goroutine to prevent GC...")
-        go keepArraysAlive()
-        log.Println("[MONITOR] Array keeper started")
+	writeLog("INFO", "Worker is ready and consuming messages", "worker", map[string]interface{}{"queue": queueName})
 
-        log.Println("[MONITOR] Starting database connections keeper goroutine...")
-        go func2.KeepConnectionsAlive()
-        log.Println("[MONITOR] Database connections keeper started")
+	go func() {
+		for d := range msgs {
+			start := time.Now()
+			var req UserRequest
+			
+			if err := json.Unmarshal(d.Body, &req); err != nil {
+				writeLog("ERROR", "Invalid JSON payload", "worker", map[string]interface{}{"payload": string(d.Body)})
+				d.Ack(false) 
+				continue
+			}
 
-        log.Println("[MONITOR] Starting database connection keeper goroutine...")
-        go func2.KeepConnectionsAlive()
-        log.Println("[MONITOR] Database connection keeper started")
+			userID, err := userManager.CreateUser(req.FirstName, req.LastName, req.Age, req.MaritalStatus)
+			duration := float64(time.Since(start).Milliseconds())
 
-        metricsRegistry.SetGauge("redis_connection_status", 1, map[string]string{})
-        metricsRegistry.SetGauge("postgres_connection_status", 1, map[string]string{})
+			if err != nil {
+				writeLog("ERROR", "Failed to process user", "worker", map[string]interface{}{
+					"error": err.Error(),
+					"user":  req.LastName,
+				})
+				d.Nack(false, true) 
+			} else {
+				writeLog("INFO", "User processed successfully", "worker", map[string]interface{}{
+					"user_id":     userID,
+					"duration_ms": duration,
+				})
+				d.Ack(false)
+				reg.IncrementCounter("processed_users_total", nil)
+			}
+		}
+	}()
 
-        log.Println("[INIT] Creating UsersManager...")
-        usersManager = users.NewUsersManager(redisClient, pgClient, metricsRegistry)
-        log.Println("[INIT] UsersManager created successfully")
+	<-sigChan
+	writeLog("INFO", "Shutting down worker gracefully...", "system", nil)
+}
+func writeLog(level, message, component string, ctx map[string]interface{}) {
+	entry := StructuredLog{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Level:     level,
+		Message:   message,
+		Component: component,
+		Context:   ctx,
+	}
+	jsonBytes, _ := json.Marshal(entry)
+	fmt.Println(string(jsonBytes))
+}
 
-        // /api/user
-        log.Println("[HTTP] Registering /api/user endpoint...")
-        http.HandleFunc("/api/user", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-                requestID := fmt.Sprintf("%d", time.Now().UnixNano())
-                requestStart := time.Now()
-
-                log.Printf("[USER:%s] Incoming %s request to /api/user from %s", requestID, r.Method, r.RemoteAddr)
-                log.Printf("[USER:%s] Headers: %v", requestID, r.Header)
-
-                if r.Method != http.MethodPost {
-                        log.Printf("[USER:%s] ERROR: Method not allowed: %s", requestID, r.Method)
-                        metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                                "method": r.Method, "endpoint": "/api/user", "status": "405",
-                        })
-                        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-                        return
-                }
-
-                var req UserRequest
-                if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-                        log.Printf("[USER:%s] ERROR: Failed to decode JSON body: %v", requestID, err)
-                        metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                                "method": r.Method, "endpoint": "/api/user", "status": "400",
-                        })
-                        json.NewEncoder(w).Encode(Response{Success: false, Message: "Invalid request"})
-                        return
-                }
-
-                log.Printf("[USER:%s] Decoded payload: first_name='%s', last_name='%s', age=%d, marital_status=%t",
-                        requestID, req.FirstName, req.LastName, req.Age, req.MaritalStatus)
-
-                userID, err := usersManager.CreateUser(req.FirstName, req.LastName, req.Age, req.MaritalStatus)
-                if err != nil {
-                        log.Printf("[USER:%s] ERROR: Failed to create user: %v", requestID, err)
-                        metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                                "method": r.Method, "endpoint": "/api/user", "status": "500",
-                        })
-                        json.NewEncoder(w).Encode(Response{Success: false, Message: err.Error()})
-                        return
-                }
-
-                metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                        "method": r.Method, "endpoint": "/api/user", "status": "200",
-                })
-                metricsRegistry.IncrementCounter("user_created_total", map[string]string{})
-                metricsRegistry.SetGauge("http_request_duration_seconds", time.Since(requestStart).Seconds(), map[string]string{
-                        "endpoint": "/api/user",
-                })
-                metricsRegistry.SetGauge("app_goroutines", float64(runtime.NumGoroutine()), map[string]string{})
-
-                log.Printf("[USER:%s] SUCCESS: User created successfully (user_id: %s)", requestID, userID)
-                log.Printf("[USER:%s] Sending response to client", requestID)
-
-                w.Header().Set("Content-Type", "application/json")
-                json.NewEncoder(w).Encode(map[string]interface{}{
-                        "success": true,
-                        "message": "User created successfully",
-                        "user_id": userID,
-                })
-                log.Printf("[USER:%s] Request completed successfully", requestID)
-        }))
-        log.Println("[HTTP] /api/user endpoint registered")
-
-        // /api/users
-        log.Println("[HTTP] Registering /api/users endpoint...")
-        http.HandleFunc("/api/users", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-                requestID := fmt.Sprintf("%d", time.Now().UnixNano())
-                requestStart := time.Now()
-
-                log.Printf("[USERS:%s] Incoming %s request to /api/users from %s", requestID, r.Method, r.RemoteAddr)
-                log.Printf("[USERS:%s] Headers: %v", requestID, r.Header)
-
-                if r.Method != http.MethodGet {
-                        log.Printf("[USERS:%s] ERROR: Method not allowed: %s", requestID, r.Method)
-                        metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                                "method": r.Method, "endpoint": "/api/users", "status": "405",
-                        })
-                        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-                        return
-                }
-
-                log.Printf("[USERS:%s] Fetching all users...", requestID)
-                usersList, err := usersManager.GetUsers()
-                if err != nil {
-                        log.Printf("[USERS:%s] ERROR: Failed to get users: %v", requestID, err)
-                        metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                                "method": r.Method, "endpoint": "/api/users", "status": "500",
-                        })
-                        json.NewEncoder(w).Encode(Response{Success: false, Message: err.Error()})
-                        return
-                }
-
-                metricsRegistry.IncrementCounter("api_requests_total", map[string]string{
-                        "method": r.Method, "endpoint": "/api/users", "status": "200",
-                })
-                metricsRegistry.SetGauge("http_request_duration_seconds", time.Since(requestStart).Seconds(), map[string]string{
-                 "endpoint": "/api/users",
-                })
-                metricsRegistry.SetGauge("app_goroutines", float64(runtime.NumGoroutine()), map[string]string{})
-
-                log.Printf("[USERS:%s] SUCCESS: Retrieved %d users", requestID, len(usersList))
-                log.Printf("[USERS:%s] Sending response to client", requestID)
-
-                w.Header().Set("Content-Type", "application/json")
-                json.NewEncoder(w).Encode(map[string]interface{}{
-                "success": true,
-                "message": "Users retrieved successfully",
-                "count":   len(usersList),
-                "users":   usersList,
-                 })
-                    log.Printf("[USERS:%s] Request completed successfully", requestID)
-                 }))
-                log.Println("[HTTP] /api/users endpoint registered")
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
