@@ -1,81 +1,150 @@
 package redis_gateway
 
 import (
-        "context"
-        "log"
-        "time"
+	"context"
+	"fmt"
+	"log"
+	"time"
 
-        "api/internal/metrics"
+	"api/internal/metrics"
 
-        "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
 )
 
-type Client struct {
-        rc      *redis.Client
-        ctx     context.Context
-        metrics *metrics.Registry
+type Config struct {
+	Addr         string
+	Password     string
+	DB           int
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	PingTimeout  time.Duration
+	OpTimeout    time.Duration
+	DefaultTTL   time.Duration
 }
 
-func NewRedisClient(addr string) *Client {
-        log.Printf("[REDIS] Creating client for address %s", addr)
+type Client struct {
+	rc      *redis.Client
+	metrics *metrics.Registry
+	cfg     Config
+}
 
-        rc := redis.NewClient(&redis.Options{
-                Addr: addr,
-        })
+func NewRedisClient(cfg Config) (*Client, error) {
+	if cfg.PingTimeout == 0 {
+		cfg.PingTimeout = 3 * time.Second
+	}
+	if cfg.OpTimeout == 0 {
+		cfg.OpTimeout = 2 * time.Second
+	}
 
-        ctx := context.Background()
-        if err := rc.Ping(ctx).Err(); err != nil {
-                log.Fatalf("[REDIS] Failed to ping Redis: %v", err)
-        }
+	log.Printf("[REDIS] Creating client for address %s", cfg.Addr)
 
-        return &Client{
-                rc:  rc,
-                ctx: ctx,
-        }
+	rc := redis.NewClient(&redis.Options{
+		Addr:         cfg.Addr,
+		Password:     cfg.Password,
+		DB:           cfg.DB,
+		DialTimeout:  cfg.DialTimeout,
+		ReadTimeout:  cfg.ReadTimeout,
+		WriteTimeout: cfg.WriteTimeout,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.PingTimeout)
+	defer cancel()
+
+	if err := rc.Ping(ctx).Err(); err != nil {
+		_ = rc.Close()
+		return nil, fmt.Errorf("redis ping: %w", err)
+	}
+
+	return &Client{
+		rc:  rc,
+		cfg: cfg,
+	}, nil
 }
 
 func (c *Client) SetMetricsRegistry(reg *metrics.Registry) {
-        c.metrics = reg
+	c.metrics = reg
 }
 
-func (c *Client) Set(key, value string) error {
-        start := time.Now()
-        err := c.rc.Set(c.ctx, key, value, 0).Err()
+func (c *Client) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	start := time.Now()
+	ctx, cancel := withTimeoutIfNone(ctx, c.cfg.OpTimeout)
+	defer cancel()
 
-        if c.metrics != nil {
-                status := "success"
-                if err != nil {
-                        status = "error"
-                }
-                c.metrics.IncrementCounter("redis_set_total", map[string]string{
-                        "status": status,
-                })
-                c.metrics.SetGauge("redis_set_duration_seconds", time.Since(start).Seconds(), map[string]string{})
-        }
+	if ttl == 0 {
+		ttl = c.cfg.DefaultTTL
+	}
 
-        return err
+	err := c.rc.Set(ctx, key, value, ttl).Err()
+	c.observeSet(err, time.Since(start))
+	return err
 }
 
-func (c *Client) Get(key string) (string, error) {
-        start := time.Now()
-        val, err := c.rc.Get(c.ctx, key).Result()
+func (c *Client) Get(ctx context.Context, key string) (string, error) {
+	start := time.Now()
+	ctx, cancel := withTimeoutIfNone(ctx, c.cfg.OpTimeout)
+	defer cancel()
 
-        if c.metrics != nil {
-                status := "success"
-                if err != nil {
-                        status = "error"
-                }
-                c.metrics.IncrementCounter("redis_get_total", map[string]string{
-                        "status": status,
-                })
-                c.metrics.SetGauge("redis_get_duration_seconds", time.Since(start).Seconds(), map[string]string{})
-        }
-
-        return val, err
+	val, err := c.rc.Get(ctx, key).Result()
+	c.observeGet(err, time.Since(start))
+	return val, err
 }
 
-func (c *Client) Close() {
-        if err := c.rc.Close(); err != nil {
-                log.Printf("[REDIS] ERROR closing client: %v", err)
-        }
+func (c *Client) Close() error {
+	if err := c.rc.Close(); err != nil {
+		log.Printf("[REDIS] ERROR closing client: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (c *Client) observeSet(err error, d time.Duration) {
+	if c.metrics == nil {
+		return
+	}
+
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+
+	c.metrics.IncrementCounter("redis_set_total", map[string]string{
+		"status": status,
+	})
+	c.metrics.SetGauge("redis_set_duration_seconds", d.Seconds(), map[string]string{
+		"stat": "last",
+	})
+}
+
+func (c *Client) observeGet(err error, d time.Duration) {
+	if c.metrics == nil {
+		return
+	}
+
+	status := "hit"
+	switch {
+	case err == nil:
+		status = "hit"
+	case err == redis.Nil:
+		status = "miss"
+	default:
+		status = "error"
+	}
+
+	c.metrics.IncrementCounter("redis_get_total", map[string]string{
+		"status": status,
+	})
+	c.metrics.SetGauge("redis_get_duration_seconds", d.Seconds(), map[string]string{
+		"stat": "last",
+	})
+}
+
+func withTimeoutIfNone(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), d)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
