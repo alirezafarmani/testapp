@@ -1,116 +1,190 @@
 package pg_gateway
 
 import (
-        "database/sql"
-        "fmt"
-        "log"
-        "time"
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"time"
 
-        "api/internal/metrics"
+	"api/internal/metrics"
 
-        _ "github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
-type Client struct {
-        db      *sql.DB
-        metrics *metrics.Registry
+type Config struct {
+	Host     string
+	Port     string
+	User     string
+	Password string
+	DBName   string
+
+	SSLMode string // 
+	
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+
+	PingTimeout  time.Duration
+	QueryTimeout time.Duration
+	ExecTimeout  time.Duration
 }
 
-func NewPGClient(host, port, user, pass, dbName string) *Client {
-        dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-                host, port, user, pass, dbName)
+type Client struct {
+	db      *sql.DB
+	metrics *metrics.Registry
+	cfg     Config
+}
 
-        log.Printf("[POSTGRES] Opening connection with DSN: %s", dsn)
+func NewPGClient(cfg Config) (*Client, error) {
+	if cfg.SSLMode == "" {
+		cfg.SSLMode = "disable"
+	}
+	if cfg.MaxOpenConns == 0 {
+		cfg.MaxOpenConns = 50
+	}
+	if cfg.MaxIdleConns == 0 {
+		cfg.MaxIdleConns = 10
+	}
+	if cfg.ConnMaxLifetime == 0 {
+		cfg.ConnMaxLifetime = 5 * time.Minute
+	}
+	if cfg.PingTimeout == 0 {
+		cfg.PingTimeout = 5 * time.Second
+	}
+	if cfg.QueryTimeout == 0 {
+		cfg.QueryTimeout = 5 * time.Second
+	}
+	if cfg.ExecTimeout == 0 {
+		cfg.ExecTimeout = 5 * time.Second
+	}
 
-        db, err := sql.Open("postgres", dsn)
-        if err != nil {
-                log.Fatalf("[POSTGRES] Failed to open DB: %v", err)
-        }
+	dsn := fmt.Sprintf(
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode,
+	)
+	log.Printf("[POSTGRES] Opening connection (host=%s port=%s dbname=%s user=%s sslmode=%s)",
+		cfg.Host, cfg.Port, cfg.DBName, cfg.User, cfg.SSLMode,
+	)
 
-        db.SetMaxOpenConns(50)
-        db.SetMaxIdleConns(10)
-        db.SetConnMaxLifetime(5 * time.Minute)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres open: %w", err)
+	}
 
-        if err := db.Ping(); err != nil {
-                log.Fatalf("[POSTGRES] Failed to ping DB: %v", err)
-        }
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.PingTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("postgres ping: %w", err)
+	}
 
-        return &Client{db: db}
+	return &Client{db: db, cfg: cfg}, nil
 }
 
 func (c *Client) SetMetricsRegistry(reg *metrics.Registry) {
-        c.metrics = reg
+	c.metrics = reg
 }
 
-func (c *Client) Close() {
-        if err := c.db.Close(); err != nil {
-                log.Printf("[POSTGRES] ERROR closing DB: %v", err)
-        }
+func (c *Client) Close() error {
+	if c.db == nil {
+		return nil
+	}
+	if err := c.db.Close(); err != nil {
+		log.Printf("[POSTGRES] ERROR closing DB: %v", err)
+		return err
+	}
+	return nil
 }
 
-func (c *Client) CreateTable() error {
-        q := `
+func (c *Client) CreateTable(ctx context.Context) error {
+	q := `
 CREATE TABLE IF NOT EXISTS users (
     user_id    TEXT PRIMARY KEY,
     data       JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
-        _, err := c.db.Exec(q)
-        if err != nil {
-                log.Printf("[POSTGRES] ERROR creating table: %v", err)
-        }
-        return err
+	ctx, cancel := withTimeoutIfNone(ctx, c.cfg.ExecTimeout)
+	defer cancel()
+
+	_, err := c.db.ExecContext(ctx, q)
+	if err != nil {
+		log.Printf("[POSTGRES] ERROR creating table: %v", err)
+	}
+	return err
 }
 
-func (c *Client) SaveUser(userID string, jsonData string) error {
-        start := time.Now()
+func (c *Client) SaveUser(ctx context.Context, userID string, jsonData string) error {
+	start := time.Now()
+	ctx, cancel := withTimeoutIfNone(ctx, c.cfg.ExecTimeout)
+	defer cancel()
 
-        _, err := c.db.Exec(`
+	_, err := c.db.ExecContext(ctx, `
 INSERT INTO users (user_id, data) VALUES ($1, $2)
 ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data
 `, userID, jsonData)
 
-        if c.metrics != nil {
-                status := "success"
-                if err != nil {
-                        status = "error"
-                }
-                c.metrics.IncrementCounter("pg_save_user_total", map[string]string{"status": status})
-                c.metrics.SetGauge("pg_save_user_duration_seconds", time.Since(start).Seconds(), map[string]string{})
-        }
-        return err
+	c.observe("pg_save_user", err, time.Since(start))
+	return err
 }
 
 type StoredUser struct {
-        UserID string `json:"user_id"`
-        Data   string `json:"data"`
+	UserID string `json:"user_id"`
+	Data   string `json:"data"`
 }
 
-func (c *Client) GetUsers() ([]StoredUser, error) {
-        start := time.Now()
-        rows, err := c.db.Query(`SELECT user_id, data::text FROM users ORDER BY created_at DESC LIMIT 1000`)
-        if err != nil {
-                if c.metrics != nil {
-                        c.metrics.IncrementCounter("pg_get_users_total", map[string]string{"status": "error"})
-                }
-                return nil, err
-        }
-        defer rows.Close()
+func (c *Client) GetUsers(ctx context.Context) ([]StoredUser, error) {
+	start := time.Now()
+	ctx, cancel := withTimeoutIfNone(ctx, c.cfg.QueryTimeout)
+	defer cancel()
 
-        var users []StoredUser
-        for rows.Next() {
-                var u StoredUser
-                if err := rows.Scan(&u.UserID, &u.Data); err != nil {
-                        return nil, err
-                }
-                users = append(users, u)
-        }
+	rows, err := c.db.QueryContext(ctx, `SELECT user_id, data::text FROM users ORDER BY created_at DESC LIMIT 1000`)
+	if err != nil {
+		c.observe("pg_get_users", err, time.Since(start))
+		return nil, err
+	}
+	defer rows.Close()
 
-        if c.metrics != nil {
-                c.metrics.IncrementCounter("pg_get_users_total", map[string]string{"status": "success"})
-                c.metrics.SetGauge("pg_get_users_duration_seconds", time.Since(start).Seconds(), map[string]string{})
-        }
+	users := make([]StoredUser, 0, 128)
+	for rows.Next() {
+		var u StoredUser
+		if err := rows.Scan(&u.UserID, &u.Data); err != nil {
+			c.observe("pg_get_users", err, time.Since(start))
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	if err := rows.Err(); err != nil {
+		c.observe("pg_get_users", err, time.Since(start))
+		return nil, err
+	}
 
-        return users, nil
+	c.observe("pg_get_users", nil, time.Since(start))
+	return users, nil
+}
+func (c *Client) observe(op string, err error, d time.Duration) {
+	if c.metrics == nil {
+		return
+	}
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	c.metrics.IncrementCounter(op+"_total", map[string]string{"status": status})
+	c.metrics.SetGauge(op+"_duration_seconds", d.Seconds(), map[string]string{"stat": "last"})
+}
+
+func withTimeoutIfNone(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), d)
+	}
+
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
